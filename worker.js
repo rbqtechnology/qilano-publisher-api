@@ -4,6 +4,8 @@
 
 
 import dotenv from "dotenv";
+import { attachNormalizedPublishResult } from "./services/publishResult.js";
+import { normalizeConfirmedPublishResponse } from "./services/publishVerification.js";
 
 
 
@@ -149,21 +151,11 @@ async function processItem(item) {
 
   }
 
-  const publishResponse = result?.json?.publish_result ?? null;
-  const externalId = String(
-    publishResponse?.publish_result?.external_id || ""
-  ).trim();
-  const permalink = String(
-    publishResponse?.publish_result?.url || ""
-  ).trim();
-  const publishedAt = String(
-    publishResponse?.publish_result?.published_at || ""
-  ).trim();
-  const publishVerified =
-    publishResponse?.success === true &&
-    externalId &&
-    publishedAt &&
-    /https?:\/\/(www\.)?instagram\.com\//i.test(permalink);
+  const publishResponse = attachNormalizedPublishResult(
+    result?.json?.publish_result ?? null
+  );
+  const confirmedPublish = normalizeConfirmedPublishResponse(publishResponse);
+  const publishVerified = confirmedPublish != null;
 
   return {
     ok: publishVerified,

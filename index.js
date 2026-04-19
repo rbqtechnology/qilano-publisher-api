@@ -25,6 +25,9 @@ import { fileURLToPath } from "url";
 import ExternalProductImportService from "./services/externalProductImportService.js";
 import InternalRepostScheduler from "./services/internalRepostScheduler.js";
 import InternalRepostFlowRunner from "./services/internalRepostFlowRunner.js";
+import { normalizeConfirmedPublishResponse } from "./services/publishVerification.js";
+import { attachNormalizedPublishResult } from "./services/publishResult.js";
+import { publishToX } from "./services/xPublishService.js";
 
 
 
@@ -5893,6 +5896,37 @@ function validatePublishBody(body) {
             .map((value) => value.trim())
             .join(" ")
         : "";
+  const tweetText =
+    typeof body?.tweet_text === "string" ? body.tweet_text.trim() : "";
+  const postText =
+    typeof body?.post_text === "string" ? body.post_text.trim() : "";
+  const socialHandle =
+    typeof body?.social_handle === "string" ? body.social_handle.trim() : "";
+  const xPayload =
+    body?.x && typeof body.x === "object" && !Array.isArray(body.x) ? body.x : {};
+  const xText =
+    typeof xPayload?.text === "string" ? xPayload.text.trim() : "";
+  const xLink =
+    typeof xPayload?.link === "string"
+      ? xPayload.link.trim()
+      : typeof body?.url === "string"
+        ? body.url.trim()
+        : "";
+  const xMediaUrlsSource =
+    Array.isArray(xPayload?.media_urls) && xPayload.media_urls.length > 0
+      ? xPayload.media_urls
+      : Array.isArray(body?.images) && body.images.length > 0
+        ? body.images
+        : body?.image_url
+          ? [body.image_url]
+          : body?.image
+            ? [body.image]
+            : [];
+  const xMediaUrls = Array.isArray(xMediaUrlsSource)
+    ? xMediaUrlsSource
+        .filter((value) => typeof value === "string" && value.trim())
+        .map((value) => value.trim())
+    : [];
 
   if (!platform) {
 
@@ -5912,20 +5946,15 @@ function validatePublishBody(body) {
 
   }
 
-  if (!url && !image && !imageUrl) {
+  if (platform && !["instagram", "x"].includes(platform)) {
 
-    errors.push("image_url, image, or url is required");
-
-  }
-
-  if (platform && platform !== "instagram") {
-
-    errors.push("platform must be instagram");
+    errors.push("platform must be instagram or x");
 
   }
 
   const normalizedImageCandidate = imageUrl || image || url;
   let normalizedImageUrl = "";
+  const normalizedXMediaUrls = [];
   const safeCaption = buildInstagramSafeCaption({
     caption,
     title,
@@ -5933,22 +5962,47 @@ function validatePublishBody(body) {
     hashtags,
   });
 
-  if (normalizedImageCandidate) {
+  if (platform === "instagram" || !platform) {
+    if (!url && !image && !imageUrl) {
 
-    const normalizedImageUrlResult = normalizeInstagramMediaUrl(
-      normalizedImageCandidate
-    );
-
-    if (!normalizedImageUrlResult.ok) {
-
-      errors.push(normalizedImageUrlResult.error);
-
-    } else {
-
-      normalizedImageUrl = normalizedImageUrlResult.value;
+      errors.push("image_url, image, or url is required");
 
     }
 
+    if (normalizedImageCandidate) {
+
+      const normalizedImageUrlResult = normalizeInstagramMediaUrl(
+        normalizedImageCandidate
+      );
+
+      if (!normalizedImageUrlResult.ok) {
+
+        errors.push(normalizedImageUrlResult.error);
+
+      } else {
+
+        normalizedImageUrl = normalizedImageUrlResult.value;
+
+      }
+
+    }
+  }
+
+  if (platform === "x") {
+    const xTextCandidate = xText || tweetText || postText;
+
+    if (!xTextCandidate && xMediaUrls.length === 0) {
+      errors.push("x publish requires x.text, tweet_text, post_text, or x.media_urls");
+    }
+
+    for (const mediaUrl of xMediaUrls) {
+      const normalizedMediaUrl = normalizeInstagramMediaUrl(mediaUrl);
+      if (!normalizedMediaUrl.ok || !normalizedMediaUrl.value) {
+        errors.push(normalizedMediaUrl.error || "x.media_urls contains an invalid URL");
+        continue;
+      }
+      normalizedXMediaUrls.push(normalizedMediaUrl.value);
+    }
   }
 
   return {
@@ -5968,6 +6022,18 @@ function validatePublishBody(body) {
       caption_length: safeCaption.caption_length,
       caption_was_truncated: safeCaption.was_truncated,
       caption_components: safeCaption.components,
+      tweet_text: tweetText,
+      post_text: postText,
+      social_handle: socialHandle,
+      x: {
+        text: xText,
+        link: xLink,
+        media_urls: xMediaUrls,
+      },
+      x_text: xText,
+      x_link: xLink,
+      x_media_urls: xMediaUrls,
+      normalized_x_media_urls: normalizedXMediaUrls,
     },
   };
 
@@ -6438,8 +6504,7 @@ function createPublishError(
   details = undefined,
   socialAccountId = null
 ) {
-
-  return {
+  return attachNormalizedPublishResult({
     success: false,
     platform: "instagram",
     social_account_id: socialAccountId,
@@ -6450,44 +6515,21 @@ function createPublishError(
       type: type || "publish_error",
       ...(details ? { details } : {}),
     },
-  };
+  });
 
 }
 
 function normalizeConfirmedInstagramPublishResponse(publishResponse) {
+  const confirmed = normalizeConfirmedPublishResponse(publishResponse);
 
-  if (!publishResponse || publishResponse.success !== true) {
-
+  if (!confirmed || confirmed.platform !== "instagram") {
     return null;
-
-  }
-
-  const externalId = String(
-    publishResponse?.publish_result?.external_id || ""
-  ).trim();
-  const permalink = String(
-    publishResponse?.publish_result?.url || ""
-  ).trim();
-  const publishedAt = String(
-    publishResponse?.publish_result?.published_at || ""
-  ).trim();
-
-  if (!externalId || !permalink || !publishedAt) {
-
-    return null;
-
-  }
-
-  if (!/https?:\/\/(www\.)?instagram\.com\//i.test(permalink)) {
-
-    return null;
-
   }
 
   return {
-    externalId,
-    permalink,
-    publishedAt,
+    externalId: confirmed.externalId,
+    permalink: confirmed.url,
+    publishedAt: confirmed.publishedAt,
   };
 
 }
@@ -7036,6 +7078,147 @@ async function markInstagramPublishAccountUsed(socialAccountId) {
 }
 
 
+function createPlatformPublishError(
+  platform,
+  message,
+  code,
+  type,
+  details = undefined,
+  socialAccountId = null
+) {
+  return attachNormalizedPublishResult({
+    success: false,
+    platform,
+    social_account_id: socialAccountId,
+    publish_result: null,
+    error: {
+      message,
+      code: code == null ? null : String(code),
+      type: type || "publish_error",
+      ...(details ? { details } : {}),
+    },
+  });
+}
+
+function validateXPublishAccount(account, requestedSocialAccountId = null) {
+  const responseSocialAccountId = account?.id ?? requestedSocialAccountId ?? null;
+
+  if (!account) {
+    return createPlatformPublishError(
+      "x",
+      "No X social account is available for publishing",
+      "SOCIAL_ACCOUNT_NOT_FOUND",
+      "account_error",
+      undefined,
+      responseSocialAccountId
+    );
+  }
+
+  if (String(account.platform || "").trim().toLowerCase() !== "x") {
+    return createPlatformPublishError(
+      "x",
+      "Selected social account platform must be x",
+      "INVALID_PLATFORM",
+      "account_error",
+      undefined,
+      responseSocialAccountId
+    );
+  }
+
+  if (String(account.status || "").trim().toLowerCase() !== "active") {
+    return createPlatformPublishError(
+      "x",
+      "X social account is not active",
+      "ACCOUNT_INACTIVE",
+      "account_error",
+      undefined,
+      responseSocialAccountId
+    );
+  }
+
+  if (account.hidden === true) {
+    return createPlatformPublishError(
+      "x",
+      "X social account is hidden",
+      "ACCOUNT_HIDDEN",
+      "account_error",
+      undefined,
+      responseSocialAccountId
+    );
+  }
+
+  if (!String(account.access_token || "").trim()) {
+    return createPlatformPublishError(
+      "x",
+      "X social account is missing access_token",
+      "ACCESS_TOKEN_MISSING",
+      "account_error",
+      undefined,
+      responseSocialAccountId
+    );
+  }
+
+  return null;
+}
+
+async function markPublishAccountUsed(platform, socialAccountId) {
+  if (!Number.isInteger(socialAccountId) || socialAccountId <= 0) {
+    return;
+  }
+
+  try {
+    await pool.query(
+      `
+        UPDATE social_accounts
+        SET last_used_at = NOW()
+        WHERE id = $1
+      `,
+      [socialAccountId]
+    );
+  } catch (error) {
+    console.warn(
+      `[${platform}] published with social account ${socialAccountId} but failed to update last_used_at: ${
+        error?.message || error
+      }`
+    );
+  }
+}
+
+async function publishToXWithSocialAccount(payload) {
+  const requestedSocialAccountId =
+    Number.isInteger(payload?.social_account_id) && payload.social_account_id > 0
+      ? payload.social_account_id
+      : null;
+  const account = await findPublishAccountForPlatform("x", requestedSocialAccountId);
+  const accountError = validateXPublishAccount(account, requestedSocialAccountId);
+
+  if (accountError) {
+    return accountError;
+  }
+
+  const publishResponse = await publishToX(payload, account, {
+    config: {
+      apiBaseUrl:
+        normalizeOptionalString(process.env.X_API_BASE_URL) ||
+        "https://api.x.com",
+    },
+  });
+
+  if (publishResponse?.success === true) {
+    await markPublishAccountUsed("x", account.id);
+  } else {
+    console.warn("[x] publish failed", {
+      product_id: payload?.product_id ?? null,
+      social_account_id: account.id,
+      code: publishResponse?.error?.code ?? null,
+      type: publishResponse?.error?.type ?? null,
+      message: publishResponse?.error?.message ?? "X publish failed",
+    });
+  }
+
+  return publishResponse;
+}
+
 async function publishToInstagram(payload) {
 
   const config = getInstagramPublishConfig();
@@ -7173,7 +7356,7 @@ async function publishToInstagram(payload) {
 
     await markInstagramPublishAccountUsed(publishAccountId);
 
-    return {
+    return attachNormalizedPublishResult({
       success: true,
       platform: "instagram",
       social_account_id: publishAccountId,
@@ -7184,7 +7367,7 @@ async function publishToInstagram(payload) {
         caption: mediaDetails?.caption || payload.caption,
       },
       error: null,
-    };
+    });
 
   } catch (error) {
 
@@ -7229,13 +7412,19 @@ app.post("/publish", workerAuth, async (req, res) => {
 
     }
 
+    if (value.platform === "x") {
+      return res.json(await publishToXWithSocialAccount(value));
+    }
+
     return res.json(await publishToInstagram(value));
 
   } catch (e) {
 
-    console.error(`[instagram] unexpected publish error: ${e.message}`);
+    const platform = normalizeRequiredPlatform(req.body?.platform) || "instagram";
+    console.error(`[${platform}] unexpected publish error: ${e.message}`);
     return res.json(
-      createPublishError(
+      createPlatformPublishError(
+        platform,
         e.message || "Server error",
         "SERVER_ERROR",
         "server_error"
@@ -7313,7 +7502,23 @@ async function claimQueueItem({ workerId, leaseSeconds }) {
         AND EXISTS (
           SELECT 1
           FROM social_accounts sa
-          WHERE sa.platform = 'instagram'
+          WHERE sa.platform = COALESCE(
+              (
+                SELECT lower(
+                  btrim(
+                    COALESCE(
+                      iwd.payload->>'social_platform',
+                      iwd.payload->>'platform'
+                    )
+                  )
+                )
+                FROM inbound_webhook_deliveries iwd
+                WHERE iwd.queue_item_id = pq.id
+                ORDER BY iwd.updated_at DESC NULLS LAST, iwd.created_at DESC NULLS LAST, iwd.id DESC
+                LIMIT 1
+              ),
+              'instagram'
+            )
             AND sa.status = 'active'
             AND sa.hidden = false
         )
@@ -8456,7 +8661,157 @@ function buildCurrentQueueImageSelection(item) {
   };
 }
 
-function buildPreparedRepostData(item, socialAccount = null) {
+async function findLatestInboundWebhookDeliveryForQueueItem(queueItemId) {
+  if (!Number.isInteger(queueItemId) || queueItemId <= 0) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+      SELECT id, payload, created_at, updated_at
+      FROM inbound_webhook_deliveries
+      WHERE queue_item_id = $1
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+      LIMIT 1
+    `,
+    [queueItemId]
+  );
+
+  return result.rows[0] || null;
+}
+
+function extractPublishMetadata(source = null, fallback = {}) {
+  const normalizedSource =
+    source && typeof source === "object" && !Array.isArray(source) ? source : {};
+  const xSource =
+    normalizedSource.x &&
+    typeof normalizedSource.x === "object" &&
+    !Array.isArray(normalizedSource.x)
+      ? normalizedSource.x
+      : {};
+  const topLevelImages = normalizeQueueImages(
+    normalizedSource.images ??
+      normalizedSource.image_url ??
+      normalizedSource.image ??
+      fallback.selected_image ??
+      fallback.images
+  );
+  const xMediaUrls = normalizeQueueImages(xSource.media_urls);
+  const platform =
+    normalizeRequiredPlatform(
+      normalizedSource.social_platform ?? normalizedSource.platform
+    ) || "instagram";
+
+  return {
+    platform,
+    social_account_id: normalizeOptionalInteger(
+      normalizedSource.social_account_id
+    ),
+    social_handle:
+      normalizeOptionalString(normalizedSource.social_handle) ||
+      normalizeOptionalString(normalizedSource.handle) ||
+      null,
+    tweet_text: normalizeOptionalString(normalizedSource.tweet_text) || null,
+    post_text:
+      normalizeOptionalString(normalizedSource.post_text) ||
+      normalizeOptionalString(normalizedSource.last_caption) ||
+      fallback.caption ||
+      null,
+    x: {
+      text: normalizeOptionalString(xSource.text) || null,
+      link:
+        normalizeOptionalString(xSource.link) ||
+        normalizeOptionalString(normalizedSource.url) ||
+        fallback.url ||
+        null,
+      media_urls:
+        Array.isArray(xMediaUrls) && xMediaUrls.length > 0
+          ? xMediaUrls
+          : Array.isArray(topLevelImages)
+            ? topLevelImages
+            : [],
+    },
+  };
+}
+
+async function findSocialAccountById(socialAccountId) {
+  if (!Number.isInteger(socialAccountId) || socialAccountId <= 0) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+      SELECT ${INSTAGRAM_PUBLISH_ACCOUNT_FIELDS}, handle, refresh_token, raw
+      FROM social_accounts
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [socialAccountId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function findDefaultActiveVisibleSocialAccount(platform) {
+  const normalizedPlatform = normalizeRequiredPlatform(platform);
+  if (!normalizedPlatform) {
+    return null;
+  }
+
+  const defaultAccount = await pool.query(
+    `
+      SELECT ${INSTAGRAM_PUBLISH_ACCOUNT_FIELDS}, handle, refresh_token, raw
+      FROM social_accounts
+      WHERE platform = $1
+        AND status = 'active'
+        AND hidden = false
+        AND is_default = true
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+      LIMIT 1
+    `,
+    [normalizedPlatform]
+  );
+
+  if (defaultAccount.rowCount > 0) {
+    return defaultAccount.rows[0];
+  }
+
+  const latestActiveVisible = await pool.query(
+    `
+      SELECT ${INSTAGRAM_PUBLISH_ACCOUNT_FIELDS}, handle, refresh_token, raw
+      FROM social_accounts
+      WHERE platform = $1
+        AND status = 'active'
+        AND hidden = false
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+      LIMIT 1
+    `,
+    [normalizedPlatform]
+  );
+
+  return latestActiveVisible.rows[0] || null;
+}
+
+async function findPublishAccountForPlatform(platform, socialAccountId = null) {
+  const normalizedPlatform = normalizeRequiredPlatform(platform) || "instagram";
+
+  if (normalizedPlatform === "instagram") {
+    return findInstagramPublishAccount(socialAccountId);
+  }
+
+  if (Number.isInteger(socialAccountId) && socialAccountId > 0) {
+    return findSocialAccountById(socialAccountId);
+  }
+
+  return findDefaultActiveVisibleSocialAccount(normalizedPlatform);
+}
+
+function buildPreparedRepostData(
+  item,
+  socialAccount = null,
+  publishMetadata = null,
+  linkedDeliveryId = null
+) {
   const serializedItem = serializeQueueItemForApi(item);
   const title = normalizeOptionalString(item?.last_title);
   const description = normalizeOptionalString(item?.last_description);
@@ -8465,17 +8820,37 @@ function buildPreparedRepostData(item, socialAccount = null) {
   const sourceUrl = normalizeOptionalString(item?.url);
   const images = normalizeQueueImages(item?.images);
   const selection = buildCurrentQueueImageSelection(item);
+  const metadata = extractPublishMetadata(publishMetadata, {
+    url: sourceUrl,
+    caption,
+    selected_image: selection.selectedImage,
+    images,
+  });
+  const platform =
+    metadata.platform ||
+    normalizeRequiredPlatform(socialAccount?.platform) ||
+    "instagram";
   const normalizedPublishInput = {
-    platform: "instagram",
+    platform,
     product_id: item?.product_id,
     image_url: selection.selectedImage,
     title,
     description,
     caption,
     hashtags,
+    tweet_text: metadata.tweet_text,
+    post_text: metadata.post_text,
+    social_handle: metadata.social_handle,
+    x: metadata.x,
   };
-  if (Number.isInteger(socialAccount?.id) && socialAccount.id > 0) {
-    normalizedPublishInput.social_account_id = socialAccount.id;
+  const preparedSocialAccountId =
+    Number.isInteger(socialAccount?.id) && socialAccount.id > 0
+      ? socialAccount.id
+      : Number.isInteger(metadata.social_account_id) && metadata.social_account_id > 0
+        ? metadata.social_account_id
+        : null;
+  if (preparedSocialAccountId != null) {
+    normalizedPublishInput.social_account_id = preparedSocialAccountId;
   }
   const normalizedPublish = validatePublishBody(normalizedPublishInput);
 
@@ -8501,17 +8876,23 @@ function buildPreparedRepostData(item, socialAccount = null) {
     publish_count: Number.isInteger(item?.publish_count) ? item.publish_count : 0,
     max_republish: resolveQueueMaxRepublish(item?.max_republish),
     status: item?.status || null,
-    platform: "instagram",
-    social_account_id: socialAccount?.id ?? null,
+    platform,
+    social_account_id: preparedSocialAccountId,
     social_account: socialAccount
       ? {
           id: socialAccount.id,
           platform: socialAccount.platform,
+          handle: socialAccount.handle,
           status: socialAccount.status,
           hidden: socialAccount.hidden,
           is_default: socialAccount.is_default,
         }
       : null,
+    social_handle: metadata.social_handle,
+    tweet_text: metadata.tweet_text,
+    post_text: metadata.post_text,
+    x: metadata.x,
+    linked_delivery_id: linkedDeliveryId,
     workflow_source: item?.workflow_source ?? null,
     locked_by: item?.locked_by || null,
     lease_expires_at: item?.lease_expires_at || null,
@@ -8734,8 +9115,23 @@ async function prepareClaimedRepostContext({ id, workerId }) {
     }
 
     const item = row.rows[0];
-    const socialAccount = await findInstagramPublishAccount(null);
-    const prepared = buildPreparedRepostData(item, socialAccount);
+    const linkedDelivery = await findLatestInboundWebhookDeliveryForQueueItem(item.id);
+    const publishMetadata = extractPublishMetadata(linkedDelivery?.payload, {
+      url: normalizeOptionalString(item?.url),
+      caption: normalizeOptionalString(item?.last_caption),
+      selected_image: normalizeOptionalString(item?.last_image),
+      images: normalizeQueueImages(item?.images),
+    });
+    const socialAccount = await findPublishAccountForPlatform(
+      publishMetadata.platform,
+      publishMetadata.social_account_id
+    );
+    const prepared = buildPreparedRepostData(
+      item,
+      socialAccount,
+      linkedDelivery?.payload,
+      linkedDelivery?.id ?? null
+    );
 
     if (!prepared.product_id) {
       return {
@@ -8781,6 +9177,10 @@ function buildValidatedPublishPayload(prepared) {
     hashtags: prepared.hashtags,
     image: prepared.selected_image,
     image_url: prepared.selected_image,
+    tweet_text: prepared.tweet_text,
+    post_text: prepared.post_text,
+    social_handle: prepared.social_handle,
+    x: prepared.x,
   };
   if (Number.isInteger(prepared.social_account_id) && prepared.social_account_id > 0) {
     payloadCandidate.social_account_id = prepared.social_account_id;
@@ -8817,6 +9217,11 @@ function buildValidatedPublishPayload(prepared) {
       caption_length: value.caption_length ?? 0,
       caption_was_truncated: value.caption_was_truncated === true,
       caption_components: value.caption_components ?? null,
+      tweet_text: value.tweet_text || null,
+      post_text: value.post_text || null,
+      social_handle: value.social_handle || null,
+      x: value.x || null,
+      normalized_x_media_urls: value.normalized_x_media_urls || [],
     },
   };
 }
@@ -8939,7 +9344,7 @@ async function applyInternalPublishStatusUpdate({ id, workerId, publishResponse,
     return null;
   }
 
-  if (normalizeConfirmedInstagramPublishResponse(publishResponse)) {
+  if (normalizeConfirmedPublishResponse(publishResponse)) {
     return succeedClaimedQueueItem({ id, workerId });
   }
 
@@ -8982,6 +9387,10 @@ async function executeInternalPublishForQueueItem({
       hashtags: explicitRewrite.prepared.hashtags,
       image: explicitRewrite.prepared.selected_image,
       image_url: explicitRewrite.prepared.selected_image,
+      tweet_text: explicitRewrite.prepared.tweet_text,
+      post_text: explicitRewrite.prepared.post_text,
+      social_handle: explicitRewrite.prepared.social_handle,
+      x: explicitRewrite.prepared.x,
     };
     if (
       Number.isInteger(explicitRewrite.prepared.social_account_id) &&
@@ -9012,6 +9421,10 @@ async function executeInternalPublishForQueueItem({
         hashtags: rewrittenPrepared.prepared.hashtags,
         image: rewrittenPrepared.prepared.selected_image,
         image_url: rewrittenPrepared.prepared.selected_image,
+        tweet_text: rewrittenPrepared.prepared.tweet_text,
+        post_text: rewrittenPrepared.prepared.post_text,
+        social_handle: rewrittenPrepared.prepared.social_handle,
+        x: rewrittenPrepared.prepared.x,
       };
       if (
         Number.isInteger(rewrittenPrepared.prepared.social_account_id) &&
@@ -9051,24 +9464,30 @@ async function executeInternalPublishForQueueItem({
     };
   }
 
-  const imageValidation = await validateInstagramPublishImageSelection(
-    payloadResult.prepared,
-    payloadResult.payload
-  );
-  if (!imageValidation.ok) {
-    return {
-      httpStatus: 200,
-      status: "publish_failed",
-      message: imageValidation.error?.error?.message || imageValidation.error?.message,
-      prepared: payloadResult.prepared,
-      payload: payloadResult.payload,
-      publishResponse: imageValidation.error,
-      statusUpdate: null,
-      rewriteResult,
-    };
-  }
+  let publishResponse = null;
 
-  const publishResponse = await publishToInstagram(payloadResult.payload);
+  if ((payloadResult.payload?.platform || "instagram") === "x") {
+    publishResponse = await publishToXWithSocialAccount(payloadResult.payload);
+  } else {
+    const imageValidation = await validateInstagramPublishImageSelection(
+      payloadResult.prepared,
+      payloadResult.payload
+    );
+    if (!imageValidation.ok) {
+      return {
+        httpStatus: 200,
+        status: "publish_failed",
+        message: imageValidation.error?.error?.message || imageValidation.error?.message,
+        prepared: payloadResult.prepared,
+        payload: payloadResult.payload,
+        publishResponse: imageValidation.error,
+        statusUpdate: null,
+        rewriteResult,
+      };
+    }
+
+    publishResponse = await publishToInstagram(payloadResult.payload);
+  }
   const wasSuccessful = publishResponse?.success === true;
 
   return {
@@ -9341,10 +9760,10 @@ app.post("/worker/succeed/:id", workerAuth, async (req, res) => {
 
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   const publishResponse = req.body?.publish_response || req.body?.publishResponse || null;
-  const confirmedPublish = normalizeConfirmedInstagramPublishResponse(publishResponse);
+  const confirmedPublish = normalizeConfirmedPublishResponse(publishResponse);
   if (!confirmedPublish) {
     return res.status(422).json({
-      error: "Confirmed Instagram publish verification is required before marking success",
+      error: "Confirmed publish verification is required before marking success",
       required_fields: ["publish_response.publish_result.external_id", "publish_response.publish_result.url", "publish_response.publish_result.published_at"],
     });
   }
