@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+vendor/
+
+*.log
+logs/
+cache/
+.cache/
+coverage/
+dist/
+build/
+.next/

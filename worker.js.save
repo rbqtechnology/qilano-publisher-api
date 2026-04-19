@@ -1,0 +1,270 @@
+// /home/ubuntu/publisher-api/worker.js
+
+
+
+import dotenv from "dotenv";
+
+
+
+
+dotenv.config({ quiet: true, path: "/home/ubuntu/publisher-api/.env" });
+
+
+
+
+
+const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
+
+
+
+// ========================
+
+// Config
+
+// ========================
+
+
+
+const API_BASE = process.env.API_BASE || "https://api.qilano.com";
+
+const WORKER_TOKEN = process.env.WORKER_TOKEN || "supersecretworker";
+
+const WORKER_ID = process.env.WORKER_ID || "w1";
+
+const LEASE_SECONDS = Number(process.env.LEASE_SECONDS || 60);
+
+const HEARTBEAT_EVERY_MS = Number(process.env.HEARTBEAT_EVERY_MS || 20000);
+
+const IDLE_SLEEP_MS = Number(process.env.IDLE_SLEEP_MS || 3000);
+
+const RECOVER_EVERY_MS = Number(process.env.RECOVER_EVERY_MS || 60000);
+
+
+
+// ========================
+
+// HTTP helper
+
+// ========================
+
+
+
+async function workerPost2(path, body) {
+
+  const r = await fetch(`${API_BASE}${path}`, {
+
+    method: "POST",
+
+    headers: {
+
+      "x-worker-token": WORKER_TOKEN,
+
+      "Content-Type": "application/json",
+
+    },
+
+    body: JSON.stringify(body || {}),
+
+  });
+
+
+
+  const json = await r.json().catch(() => ({}));
+
+  return { status: r.status, json };
+
+}
+
+
+
+// ========================
+
+// Heartbeat
+
+// ========================
+
+
+
+function startHeartbeat(id) {
+
+  return setInterval(() => {
+
+    workerPost2(`/worker/heartbeat/${id}`, {
+
+      worker_id: WORKER_ID,
+
+      lease_seconds: LEASE_SECONDS,
+
+    }).catch(() => {});
+
+  }, HEARTBEAT_EVERY_MS);
+
+}
+
+
+
+// ========================
+
+// Your publish logic (replace this)
+
+// ========================
+
+
+
+async function processItem(item) {
+
+  // TODO: Put your real publish logic here
+
+  // Return true on success, false on failure.
+
+  // If you throw, it will be handled as failure with error message.
+
+  return true;
+
+}
+
+
+
+// ========================
+
+// Main loop
+
+// ========================
+
+
+
+async function runOnce() {
+
+  console.log('[worker] claim...');
+  const claim = console.log("[worker] recover-stuck tick");
+      await workerPost2("/worker/claim", {
+
+    worker_id: WORKER_ID,
+
+    lease_seconds: LEASE_SECONDS,
+
+  });
+
+
+
+  const item = claim.json?.item;
+
+  if (!item) return false;
+
+
+
+  const id = item.id; console.log('[worker] claimed id=', id);
+
+  const hb = startHeartbeat(id);
+
+
+
+  try {
+
+    const ok = await processItem(item);
+
+
+
+    if (ok) {
+
+      console.log("[worker] recover-stuck tick");
+      await workerPost2(`/worker/succeed/${id}`, { worker_id: WORKER_ID });
+
+    } else {
+
+      console.log("[worker] recover-stuck tick");
+      await workerPost2(`/worker/fail/${id}`, {
+
+        worker_id: WORKER_ID,
+
+        error: "publish failed",
+
+      });
+
+    }
+
+  } catch (e) {
+
+    console.log("[worker] recover-stuck tick");
+      await workerPost2(`/worker/fail/${id}`, {
+
+      worker_id: WORKER_ID,
+
+      error: String(e?.message || e),
+
+    });
+
+  } finally {
+
+    clearInterval(hb); console.log('[worker] done id=', id);
+
+  }
+
+
+
+  return true;
+
+}
+
+
+
+// Recover stuck jobs periodically (optional but useful)
+
+let lastRecoverAt = 0;
+
+async function maybeRecoverStuck() {
+
+  const now = Date.now();
+
+  if (now - lastRecoverAt < RECOVER_EVERY_MS) return;
+
+  lastRecoverAt = now;
+
+  console.log("[worker] recover-stuck tick");
+try {
+
+  const res = await workerPost2("/worker/recover-stuck", {});
+
+  if (res?.status && res.status >= 400) {
+
+    console.log("[worker] recover-stuck failed", res.status, res.json);
+
+  }
+
+} catch (e) {
+
+  console.log("[worker] recover-stuck error", e?.message || e);
+
+}
+
+}
+
+
+
+async function sleep(ms) {
+
+  return new Promise((r) => setTimeout(r, ms));
+
+}
+
+
+
+async function main() {
+
+  while (true) {
+
+    await maybeRecoverStuck();
+
+
+
+    const didWork = await runOnce();
+
+    if (!didWork) await sleep(IDLE_SLEEP_MS);
+
+  }
+
+}
+
+
+
+main().catch((e)=>{ console.error("[worker fatal]", e); process.exit(1); });
